@@ -1,0 +1,100 @@
+name: Feature branch deployment
+
+on:
+  push:
+    branches-ignore: [ master, staging ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-18.04
+
+    steps:
+
+    # Checkout code including submodule
+    - uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.REPOSITORY_READ_TOKEN }}
+        submodules: true
+
+    # Install node
+    - name: Setup Node
+      uses: actions/setup-node@v1
+      with:
+        node-version: '12.x'
+
+    # Build
+    - name: Build
+      run: |
+        cd app/
+        sed -e "s,// publicPath: '/',publicPath: '/${GITHUB_REF##*/}'," -i vue.config.js
+        npm install --prefer-offline --no-audit
+        npm run build
+
+    # Inject SH Config file
+    - name: replace instance ID
+      uses: datamonsters/replace-action@v2
+      with:
+        files: 'app/dist/shConfig.js'
+        replacements: '$SH_INSTANCE_ID=${{ secrets.SH_INSTANCE_ID }},$SH_INSTANCE_ID_TRILATERAL=${{ secrets.SH_INSTANCE_ID_TRILATERAL }},$MAPBOX_ACCESS_TOKEN=${{ secrets.MAPBOX_ACCESS_TOKEN }},$GEODB_INSTANCE_ID=${{ secrets.GEODB_INSTANCE_ID }}'
+
+    # Upload build client to S3
+    - name: sync client s3
+      uses: jakejarvis/s3-sync-action@v0.5.1
+      with:
+        args: --delete --follow-symlinks --exclude 'data/*'  --exclude 'eodash-data/*'
+      env:
+        SOURCE_DIR: 'app/dist'
+        DEST_DIR: 'feature-branches/${GITHUB_REF##*/}'
+        AWS_REGION: 'eu-central-1'
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # Upload data to S3
+    - name: sync data s3
+      uses: jakejarvis/s3-sync-action@v0.5.1
+      with:
+        args: --delete --follow-symlinks --size-only
+      env:
+        SOURCE_DIR: 'app/dist/data'
+        DEST_DIR: 'feature-branches/${GITHUB_REF##*/}/data'
+        AWS_REGION: 'eu-central-1'
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # Upload eodashdata to S3
+    - name: sync eodashdata s3
+      uses: jakejarvis/s3-sync-action@v0.5.1
+      with:
+        args: --delete --follow-symlinks --size-only
+      env:
+        SOURCE_DIR: 'app/dist/eodash-data'
+        DEST_DIR: 'feature-branches/${GITHUB_REF##*/}/eodash-data'
+        AWS_REGION: 'eu-central-1'
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # Invalidate Cloudfront
+    - name: invalidate
+      uses: chetan/invalidate-cloudfront-action@v1.2
+      env:
+        DISTRIBUTION: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_FEATUREBRANCHES }}
+        PATHS: '/*' # TODO: Only invalidate the current branch. "PATHS: '/${GITHUB_REF##*/}/*'" didn't work.
+        AWS_REGION: 'eu-central-1'
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # Send notification
+    - name: action-slack
+      uses: 8398a7/action-slack@v3.0.3
+      with:
+        status: ${{ job.status }}
+        author_name: eodash_deploy
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} # required
+      if: always()
+
+#TODO add action to remove files once branch is deleted
